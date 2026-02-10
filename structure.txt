@@ -1,0 +1,199 @@
+Pattern 1: View Functions (Simplest)
+
+  Each "screen" is a function that clears the window and builds its UI:
+
+  func main() {
+      ActivateTheme("azure light")
+      showLoadingScreen()
+      go func() {
+          if err := initializeApp(); err != nil {
+              App.Queue(func() { showErrorScreen(err) })
+          } else {
+              App.Queue(func() { showMainApp() })
+          }
+      }()
+      App.Wait()
+  }
+
+  func clearWindow() {
+      for _, w := range App.Children() {
+          w.Destroy()
+      }
+  }
+
+  func showLoadingScreen() {
+      clearWindow()
+      Pack(Label(Txt("Loading...")), Expand(true))
+  }
+
+  func showErrorScreen(err error) {
+      clearWindow()
+      Pack(
+          Label(Txt(fmt.Sprintf("Error: %v", err))),
+          Button(Txt("Retry"), Command(func() {
+              showLoadingScreen()
+              go func() {
+                  if err := initializeApp(); err != nil {
+                      App.Queue(func() { showErrorScreen(err) })
+                  } else {
+                      App.Queue(func() { showMainApp() })
+                  }
+              }()
+          })),
+          Expand(true),
+      )
+  }
+
+  func showMainApp() {
+      clearWindow()
+      // Your main UI here
+      nb := Notebook()
+      // ... add tabs ...
+      Pack(nb, Expand(true), Fill(Both))
+  }
+
+  Pattern 2: Struct-Based Views (More Organized)
+
+  Each view is a struct that manages its own state and widgets:
+
+  type View interface {
+      Show(parent *Window)
+      Hide()
+  }
+
+  type LoadingView struct {
+      label *LabelWidget
+  }
+
+  func (v *LoadingView) Show(parent *Window) {
+      v.label = Label(Txt("Loading..."))
+      Pack(v.label, Expand(true))
+  }
+
+  func (v *LoadingView) Hide() {
+      v.label.Destroy()
+  }
+
+  type ErrorView struct {
+      err     error
+      onRetry func()
+      frame   *FrameWidget
+  }
+
+  func NewErrorView(err error, onRetry func()) *ErrorView {
+      return &ErrorView{err: err, onRetry: onRetry}
+  }
+
+  func (v *ErrorView) Show(parent *Window) {
+      v.frame = Frame()
+      Pack(v.frame, Expand(true))
+
+      Label(v.frame, Txt(fmt.Sprintf("Error: %v", v.err)))
+      Button(v.frame, Txt("Retry"), Command(v.onRetry))
+  }
+
+  func (v *ErrorView) Hide() {
+      v.frame.Destroy()
+  }
+
+  type MainView struct {
+      notebook *NotebookWidget
+  }
+
+  func (v *MainView) Show(parent *Window) {
+      v.notebook = Notebook()
+      // Add tabs...
+      v.notebook.Add(createSettingsTab(), Txt("Settings"))
+      v.notebook.Add(createDataTab(), Txt("Data"))
+      Pack(v.notebook, Expand(true), Fill(Both))
+  }
+
+  // Router/Manager
+  type AppManager struct {
+      window *Window
+      current View
+  }
+
+  func (m *AppManager) SwitchTo(view View) {
+      if m.current != nil {
+          m.current.Hide()
+      }
+      m.current = view
+      view.Show(m.window)
+  }
+
+  func main() {
+      ActivateTheme("azure light")
+      manager := &AppManager{window: App}
+
+      manager.SwitchTo(&LoadingView{})
+
+      go func() {
+          if err := initializeApp(); err != nil {
+              App.Queue(func() {
+                  manager.SwitchTo(NewErrorView(err, func() {
+                      main() // or restart logic
+                  }))
+              })
+          } else {
+              App.Queue(func() {
+                  manager.SwitchTo(&MainView{})
+              })
+          }
+      }()
+
+      App.Wait()
+  }
+
+  Pattern 3: Frame-Based (Keeps Views Alive)
+
+  Use a container frame and swap content instead of destroying/recreating:
+
+  type App struct {
+      window   *Window
+      content  *FrameWidget
+  }
+
+  func (a *App) SetContent(builder func(*FrameWidget)) {
+      // Clear current content
+      for _, child := range a.content.Children() {
+          child.Destroy()
+      }
+      // Build new content
+      builder(a.content)
+  }
+
+  func main() {
+      app := &App{
+          window:  App,
+          content: Frame(),
+      }
+      Pack(app.content, Expand(true), Fill(Both))
+
+      // Use it
+      app.SetContent(func(f *FrameWidget) {
+          Label(f, Txt("Loading..."))
+          Pack(Child(f), Expand(true))  // Pack the child in the frame
+      })
+  }
+
+  Key Tips for Tk + Go
+
+  1. Always use App.Queue() when updating UI from goroutines - Tk is not thread-safe
+  2. Use Expand(true) and Fill(Both) to make widgets responsive
+  3. Consider Grid over Pack for complex layouts - it gives more control
+  4. Create reusable widget builders:
+
+  func CenteredButton(parent *Window, text string, cmd func()) *ButtonWidget {
+      frame := Frame(parent)
+      Pack(frame, Expand(true))
+      btn := Button(frame, Txt(text), Command(cmd))
+      Pack(btn)
+      return btn
+  }
+
+  Which pattern should you choose?
+
+  • Pattern 1: Good for small apps, quick to write
+  • Pattern 2: Better for medium apps with stateful views
+  • Pattern 3: Good if you want view transitions/animations
