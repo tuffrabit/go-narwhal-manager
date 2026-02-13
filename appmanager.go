@@ -2,16 +2,19 @@ package main
 
 import (
 	tk "modernc.org/tk9.0"
-
-	"github.com/tuffrabit/go-narwhal-manager/view"
 )
+
+type View interface {
+	Show(parent *tk.Window)
+	Hide()
+}
 
 type AppManager struct {
 	window  *tk.Window
-	current view.View
+	current View
 }
 
-func (m *AppManager) SwitchTo(view view.View) {
+func (m *AppManager) SwitchTo(view View) {
 	if m.current != nil {
 		m.current.Hide()
 	}

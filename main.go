@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"fmt"
 	"time"
 
@@ -10,6 +11,8 @@ import (
 
 	"github.com/tuffrabit/go-narwhal-manager/view"
 )
+
+var serialPort serial.Port
 
 func main() {
 	ActivateTheme("azure light")
@@ -26,28 +29,29 @@ func main() {
 }
 
 func handleTuffDeviceTest(manager *AppManager) {
-	if err := findTuffDevice(); err != nil {
+	port, err := findTuffDevice()
+	if err != nil {
 		PostEvent(func() {
 			manager.SwitchTo(view.NewDeviceRetryView(err, func() {
 				handleTuffDeviceTest(manager)
 			}))
 		}, false)
 	} else {
+		serialPort = port
 		PostEvent(func() {
-			manager.SwitchTo(&view.TestView{})
+			manager.SwitchTo(view.NewMainView(serialPort))
 		}, false)
 	}
 }
 
-func findTuffDevice() error {
-	fmt.Println("!STARTING TO LOOK FOR TUFF DEVICES!")
+func findTuffDevice() (serial.Port, error) {
 	ports, err := serial.GetPortsList()
 	if err != nil {
-		return fmt.Errorf("main.findTuffDevice: serial port enumeration failed, error: %w", err)
+		return nil, fmt.Errorf("main.findTuffDevice: serial port enumeration failed, error: %w", err)
 	}
 
 	if len(ports) == 0 {
-		return fmt.Errorf("main.findTuffDevice: no serial ports found")
+		return nil, fmt.Errorf("main.findTuffDevice: no serial ports found")
 	}
 
 	mode := &serial.Mode{
@@ -63,41 +67,50 @@ func findTuffDevice() error {
 
 		port, err := serial.Open(portName, mode)
 		if err != nil {
-			return fmt.Errorf("main.findTuffDevice: open port %s failed, error: %w", portName, err)
+			return nil, fmt.Errorf("main.findTuffDevice: open port %s failed, error: %w", portName, err)
 		}
 
 		port.SetReadTimeout(time.Millisecond * 1000)
 		isTuffDevice, err := testPort(port, portName)
 		if err != nil {
-			return fmt.Errorf("main.findTuffDevice: probing port %s failed, error: %w", portName, err)
+			return nil, fmt.Errorf("main.findTuffDevice: probing port %s failed, error: %w", portName, err)
 		}
 		if isTuffDevice {
-			return nil
+			return port, nil
 		}
 	}
 
-	return fmt.Errorf("main.findTuffDevice: no tuff devices found")
+	return nil, fmt.Errorf("main.findTuffDevice: no tuff devices found")
 }
 
 func testPort(port serial.Port, portName string) (bool, error) {
-	//areyouatuffpad?
 	n, err := port.Write([]byte("areyouatuffpad?\n"))
 	if err != nil {
 		return false, fmt.Errorf("main.testPort: write to port %s failed, error: %w", portName, err)
 	}
-	fmt.Printf("Sent %v bytes\n", n)
+	if n == 0 {
+		return false, fmt.Errorf("main.testPort: write to port %s failed, error: zero bytes written", portName)
+	}
 
-	buff := make([]byte, 100)
+	buff := make([]byte, 128)
 	for {
 		n, err := port.Read(buff)
 		if err != nil {
 			return false, fmt.Errorf("main.testPort: read from port %s failed, error: %w", portName, err)
 		}
 		if n == 0 {
-			fmt.Println("\nEOF")
 			break
 		}
-		fmt.Printf("%v", string(buff[:n]))
+	}
+
+	end := bytes.IndexByte(buff, '\n')
+	if end == 0 {
+		return false, nil
+	}
+
+	response := string(buff[:end])
+	if response == "areyouatuffpad?yes" {
+		return true, nil
 	}
 
 	return false, nil
