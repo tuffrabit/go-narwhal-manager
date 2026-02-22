@@ -2,10 +2,15 @@ package view
 
 import (
 	"bufio"
+	"encoding/hex"
+	"fmt"
 	"io"
+	"strings"
 
 	"go.bug.st/serial"
 	tk "modernc.org/tk9.0"
+
+	"github.com/tuffrabit/go-narwhal-manager/protocol"
 )
 
 type MainView struct {
@@ -17,12 +22,38 @@ type MainView struct {
 	// Console overlay
 	consoleFrame    *tk.TFrameWidget
 	consoleOutput   *tk.TextWidget
-	consoleInput    *tk.TEntryWidget
 	consoleScroll   *tk.TScrollbarWidget
+	
+	// Command input controls
+	cmdCombo       *tk.TComboboxWidget
+	payloadInput   *tk.TEntryWidget
 	
 	// State
 	consoleVisible  bool
 	stopReading     chan struct{}
+}
+
+// commandInfo holds metadata for each supported command
+type commandInfo struct {
+	Code        byte
+	Name        string
+	PayloadHint string
+	NeedsPayload bool
+}
+
+// availableCommands defines all protocol commands for the dropdown
+var availableCommands = []commandInfo{
+	{protocol.CmdPing, "Ping", "any data (optional)", false},
+	{protocol.CmdGetDeviceConfig, "GetDeviceConfig", "none", false},
+	{protocol.CmdSetDeviceConfig, "SetDeviceConfig", "12 bytes (device config)", true},
+	{protocol.CmdGetProfile, "GetProfile", "slot (1 byte)", true},
+	{protocol.CmdSetProfile, "SetProfile", "slot + 286 bytes", true},
+	{protocol.CmdDeleteProfile, "DeleteProfile", "slot (1 byte)", true},
+	{protocol.CmdListProfiles, "ListProfiles", "none", false},
+	{protocol.CmdGetStorageStats, "GetStorageStats", "none", false},
+	{protocol.CmdFactoryReset, "FactoryReset", "none", false},
+	{protocol.CmdGetVersion, "GetVersion", "none", false},
+	{protocol.CmdDiscover, "Discover", "none", false},
 }
 
 func NewMainView(port serial.Port) *MainView {
@@ -68,8 +99,9 @@ func (m *MainView) Hide() {
 	m.consoleVisible = false
 	m.consoleFrame = nil
 	m.consoleOutput = nil
-	m.consoleInput = nil
 	m.consoleScroll = nil
+	m.cmdCombo = nil
+	m.payloadInput = nil
 }
 
 func (m *MainView) createPlaceholderContent() *tk.TFrameWidget {
@@ -152,32 +184,56 @@ func (m *MainView) createConsoleOverlay() {
 	inputFrame := m.consoleFrame.TFrame()
 	tk.Grid(inputFrame, tk.Row(2), tk.Column(0), tk.Columnspan(2), tk.Sticky("ew"), tk.Padx(5), tk.Pady(5))
 	
-	tk.GridColumnConfigure(inputFrame, 0, tk.Weight(0))  // Label
-	tk.GridColumnConfigure(inputFrame, 1, tk.Weight(1))  // Entry
-	tk.GridColumnConfigure(inputFrame, 2, tk.Weight(0))  // Button
+	tk.GridColumnConfigure(inputFrame, 0, tk.Weight(0))  // Command label
+	tk.GridColumnConfigure(inputFrame, 1, tk.Weight(0))  // Command dropdown
+	tk.GridColumnConfigure(inputFrame, 2, tk.Weight(0))  // Payload label
+	tk.GridColumnConfigure(inputFrame, 3, tk.Weight(1))  // Payload entry
+	tk.GridColumnConfigure(inputFrame, 4, tk.Weight(0))  // Send button
 	
-	// Input label
-	inputLabel := inputFrame.TLabel(tk.Txt("Command:"))
-	tk.Grid(inputLabel, tk.Row(0), tk.Column(0), tk.Sticky("w"))
+	// Command dropdown label
+	cmdLabel := inputFrame.TLabel(tk.Txt("Command:"))
+	tk.Grid(cmdLabel, tk.Row(0), tk.Column(0), tk.Sticky("w"), tk.Padx(2))
 	
-	// Input entry - starts empty
-	m.consoleInput = inputFrame.TEntry(
-		tk.Textvariable(""),
-		tk.Width(60),
+	// Command dropdown - populate with command names
+	cmdNames := make([]string, len(availableCommands))
+	for i, cmd := range availableCommands {
+		cmdNames[i] = cmd.Name
+	}
+	m.cmdCombo = inputFrame.TCombobox(
+		tk.Values(cmdNames),
+		tk.State("readonly"),
+		tk.Width(18),
+		tk.Textvariable("Ping"), // Default selection
 	)
-	tk.Grid(m.consoleInput, tk.Row(0), tk.Column(1), tk.Sticky("ew"), tk.Padx(5))
+	tk.Grid(m.cmdCombo, tk.Row(0), tk.Column(1), tk.Sticky("w"), tk.Padx(2))
+	
+	// Bind selection change to update payload hint
+	tk.Bind(m.cmdCombo, "<<ComboboxSelected>>", tk.Command(m.updatePayloadHint))
+	
+	// Payload label
+	payloadLabel := inputFrame.TLabel(tk.Txt("Payload (hex):"))
+	tk.Grid(payloadLabel, tk.Row(0), tk.Column(2), tk.Sticky("w"), tk.Padx(5))
+	
+	// Payload entry - accepts hex bytes
+	m.payloadInput = inputFrame.TEntry(
+		tk.Width(40),
+	)
+	tk.Grid(m.payloadInput, tk.Row(0), tk.Column(3), tk.Sticky("ew"), tk.Padx(2))
 	
 	// Send button
 	sendBtn := inputFrame.TButton(
 		tk.Txt("Send"),
 		tk.Command(m.sendCommand),
 	)
-	tk.Grid(sendBtn, tk.Row(0), tk.Column(2))
+	tk.Grid(sendBtn, tk.Row(0), tk.Column(4), tk.Padx(2))
 	
 	// Bind Enter key to send command
-	tk.Bind(m.consoleInput, "<Return>", tk.Command(func() {
+	tk.Bind(m.payloadInput, "<Return>", tk.Command(func() {
 		m.sendCommand()
 	}))
+	
+	// Set initial hint
+	m.updatePayloadHint()
 	
 	// Note: Console is initially hidden (not gridded)
 }
@@ -191,8 +247,8 @@ func (m *MainView) showConsole() {
 	tk.Grid(m.consoleFrame, tk.Row(0), tk.Column(0), tk.Sticky("nsew"))
 	m.consoleVisible = true
 	
-	// Focus input
-	tk.Focus(m.consoleInput)
+	// Focus payload input
+	tk.Focus(m.payloadInput)
 	
 	// Start reading from serial port
 	m.stopReading = make(chan struct{})
@@ -228,31 +284,240 @@ func (m *MainView) clearConsole() {
 	m.consoleOutput.Configure(tk.State("disabled"))
 }
 
+func (m *MainView) updatePayloadHint() {
+	if m.payloadInput == nil {
+		return
+	}
+	
+	// Clear the payload input when command changes
+	// (The hint text was being treated as actual input)
+	m.payloadInput.Configure(tk.Textvariable(""))
+}
+
 func (m *MainView) sendCommand() {
-	if m.consoleInput == nil || m.serialPort == nil {
+	if m.serialPort == nil {
 		return
 	}
 	
-	// Get current text from entry using Textvariable() method
-	cmd := m.consoleInput.Textvariable()
-	if cmd == "" {
+	// Get selected command
+	selectedName := m.cmdCombo.Textvariable()
+	if selectedName == "" {
 		return
 	}
 	
-	// Append sent command to console
-	m.appendToConsole("> " + cmd + "\n")
+	// Find command info
+	var cmdInfo *commandInfo
+	for i := range availableCommands {
+		if availableCommands[i].Name == selectedName {
+			cmdInfo = &availableCommands[i]
+			break
+		}
+	}
+	if cmdInfo == nil {
+		return
+	}
 	
-	// Send to serial port with newline
-	cmdWithNewline := cmd + "\n"
-	_, err := m.serialPort.Write([]byte(cmdWithNewline))
+	// Parse payload from hex input
+	payloadHex := m.payloadInput.Textvariable()
+	payloadHex = strings.TrimSpace(payloadHex)
+	
+	// Show hint if payload is empty and command expects one
+	if payloadHex == "" && cmdInfo.NeedsPayload {
+		m.appendToConsole(fmt.Sprintf("[HINT: %s expects payload: %s]\n", cmdInfo.Name, cmdInfo.PayloadHint))
+	}
+	
+	payload, err := parseHexString(payloadHex)
 	if err != nil {
-		m.appendToConsole("[ERROR sending: " + err.Error() + "]\n")
+		m.appendToConsole(fmt.Sprintf("[ERROR: invalid hex payload: %v]\n", err))
+		return
 	}
 	
-	// Clear input by setting empty textvariable
-	m.consoleInput.Configure(tk.Textvariable(""))
+	// Build the frame (handles length + CRC automatically)
+	frame := protocol.BuildFrame(cmdInfo.Code, payload)
 	
-	tk.Focus(m.consoleInput)
+	// Display what we're sending
+	m.appendToConsole(fmt.Sprintf("> %s\n", formatHexBytes(frame)))
+	m.appendToConsole(fmt.Sprintf("  → %s [payload: %d bytes]\n", cmdInfo.Name, len(payload)))
+	
+	// Send raw bytes to serial port
+	_, err = m.serialPort.Write(frame)
+	if err != nil {
+		m.appendToConsole(fmt.Sprintf("[ERROR sending: %v]\n", err))
+		return
+	}
+	
+	// Clear payload input (but keep command selection)
+	m.payloadInput.Configure(tk.Textvariable(""))
+	m.updatePayloadHint()
+	
+	tk.Focus(m.payloadInput)
+}
+
+// parseHexString converts a space-separated hex string to bytes
+// Accepts: "01 02 AB" or "0102AB" or "01,02,ab"
+func parseHexString(s string) ([]byte, error) {
+	s = strings.TrimSpace(s)
+	if s == "" || s == "none" {
+		return nil, nil
+	}
+	
+	// Remove common separators
+	s = strings.ReplaceAll(s, ",", " ")
+	s = strings.ReplaceAll(s, "0x", " ")
+	s = strings.ReplaceAll(s, "0X", " ")
+	
+	// If no spaces, try to parse as continuous hex
+	if !strings.Contains(s, " ") {
+		// Check if it looks like a hint text (contains letters other than hex)
+		if len(s) > 0 && s[0] >= 'a' && s[0] <= 'z' || s[0] >= 'A' && s[0] <= 'Z' {
+			// It's a hint text, treat as empty payload
+			return nil, nil
+		}
+		// Continuous hex string - ensure even length
+		if len(s)%2 != 0 {
+			s = "0" + s
+		}
+		return hex.DecodeString(s)
+	}
+	
+	// Space-separated: normalize and decode
+	parts := strings.Fields(s)
+	var result []byte
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		b, err := hex.DecodeString(part)
+		if err != nil {
+			return nil, fmt.Errorf("invalid hex '%s': %w", part, err)
+		}
+		result = append(result, b...)
+	}
+	return result, nil
+}
+
+// formatHexBytes formats bytes as space-separated hex
+func formatHexBytes(data []byte) string {
+	if len(data) == 0 {
+		return "<empty>"
+	}
+	var parts []string
+	for _, b := range data {
+		parts = append(parts, fmt.Sprintf("%02X", b))
+	}
+	return strings.Join(parts, " ")
+}
+
+// parseFrameAndDisplay attempts to parse a received frame and display both raw and parsed
+func (m *MainView) parseFrameAndDisplay(data []byte) {
+	if len(data) < protocol.MinFrameSize {
+		m.appendToConsole(fmt.Sprintf("< %s\n", formatHexBytes(data)))
+		m.appendToConsole("  ← [incomplete frame]\n")
+		return
+	}
+	
+	// Check sync byte
+	if data[0] != protocol.SyncByte {
+		m.appendToConsole(fmt.Sprintf("< %s\n", formatHexBytes(data)))
+		m.appendToConsole(fmt.Sprintf("  ← [invalid sync: 0x%02X]\n", data[0]))
+		return
+	}
+	
+	status, payload, err := protocol.ParseFrame(data)
+	if err != nil {
+		m.appendToConsole(fmt.Sprintf("< %s\n", formatHexBytes(data)))
+		m.appendToConsole(fmt.Sprintf("  ← [parse error: %v]\n", err))
+		return
+	}
+	
+	// Successfully parsed
+	m.appendToConsole(fmt.Sprintf("< %s\n", formatHexBytes(data)))
+	
+	// Format parsed response
+	statusStr := formatStatusCode(status)
+	payloadDesc := formatPayload(status, payload)
+	m.appendToConsole(fmt.Sprintf("  ← %s %s\n", statusStr, payloadDesc))
+}
+
+// formatStatusCode returns a human-readable status name
+func formatStatusCode(status byte) string {
+	switch status {
+	case protocol.StatusOK:
+		return "OK"
+	case protocol.StatusError:
+		return "ERROR"
+	case protocol.StatusInvalidCmd:
+		return "INVALID_CMD"
+	case protocol.StatusInvalidData:
+		return "INVALID_DATA"
+	case protocol.StatusNotFound:
+		return "NOT_FOUND"
+	case protocol.StatusNoSpace:
+		return "NO_SPACE"
+	case protocol.StatusVersionMismatch:
+		return "VERSION_MISMATCH"
+	case protocol.StatusCRCError:
+		return "CRC_ERROR"
+	default:
+		return fmt.Sprintf("UNKNOWN(0x%02X)", status)
+	}
+}
+
+// formatPayload provides a description of the payload based on status/command context
+func formatPayload(status byte, payload []byte) string {
+	if len(payload) == 0 {
+		return ""
+	}
+	
+	// For error responses, just show byte count
+	if status != protocol.StatusOK {
+		return fmt.Sprintf("[%d bytes]", len(payload))
+	}
+	
+	// For OK responses, try to interpret based on known response types
+	if len(payload) == 12 {
+		// Likely DeviceConfig
+		var cfg protocol.DeviceConfig
+		if err := cfg.UnmarshalBinary(payload); err == nil {
+			return fmt.Sprintf("[DeviceConfig v%d, profile=%d, brightness=%d]",
+				cfg.Version, cfg.ActiveProfile, cfg.Brightness)
+		}
+	}
+	
+	if len(payload) == 286 {
+		return "[Profile: 286 bytes]"
+	}
+	
+	if len(payload) == 16 {
+		// Likely StorageStats
+		var stats protocol.StorageStats
+		if err := stats.UnmarshalBinary(payload); err == nil {
+			return fmt.Sprintf("[Storage: %d/%d blocks used]", stats.UsedBlocks, stats.TotalBlocks)
+		}
+	}
+	
+	if len(payload) == 4 {
+		// Likely GetVersion response
+		return fmt.Sprintf("[Version: fw=%d.%d, cfg=v%d]", payload[0], payload[1], payload[2]|payload[3]<<8)
+	}
+	
+	// Check for "tuffpad" discovery response
+	if string(payload) == "tuffpad" {
+		return "[Discover: tuffpad]"
+	}
+	
+	// Check for profile list response
+	if len(payload) > 0 && len(payload) < 20 {
+		// Could be profile list: [count][slot1][slot2]...
+		return fmt.Sprintf("[ProfileList: %d slots]", len(payload)-1)
+	}
+	
+	// Default: show as hex preview
+	preview := formatHexBytes(payload)
+	if len(preview) > 40 {
+		preview = preview[:37] + "..."
+	}
+	return fmt.Sprintf("[%s]", preview)
 }
 
 func (m *MainView) appendToConsole(text string) {
@@ -295,26 +560,67 @@ func (m *MainView) readSerialLoop() {
 		default:
 		}
 		
-		// Read line from serial port
-		line, err := reader.ReadString('\n')
+		// Read frame from serial port
+		// First read sync byte
+		syncByte, err := reader.ReadByte()
 		if err != nil {
 			if err == io.EOF {
-				// Serial port closed
 				m.appendToConsole("\n=== Serial port disconnected ===\n")
 				return
 			}
-			// Other error - check if we should stop
 			select {
 			case <-m.stopReading:
 				return
 			default:
-				m.appendToConsole("\n[ERROR reading: " + err.Error() + "]\n")
-				return
+				continue // Try to resync
 			}
 		}
 		
-		if line != "" {
-			m.appendToConsole(line)
+		// Check if it's a sync byte, otherwise we might be out of sync
+		if syncByte != protocol.SyncByte {
+			// Not a frame start, append as raw byte (might be debug output)
+			m.appendToConsole(string(syncByte))
+			continue
 		}
+		
+		// Read header (cmd + len: 3 bytes)
+		header := make([]byte, 3)
+		if _, err := io.ReadFull(reader, header); err != nil {
+			select {
+			case <-m.stopReading:
+				return
+			default:
+				m.appendToConsole("\n[ERROR reading header: " + err.Error() + "]\n")
+				continue
+			}
+		}
+		
+		// Extract length (little-endian uint16)
+		length := uint16(header[1]) | uint16(header[2])<<8
+		
+		// Sanity check on length
+		if length > 4096 {
+			m.appendToConsole("\n[ERROR: invalid frame length]\n")
+			continue
+		}
+		
+		// Read payload + CRC
+		remaining := make([]byte, int(length)+2) // payload + 2-byte CRC
+		if _, err := io.ReadFull(reader, remaining); err != nil {
+			select {
+			case <-m.stopReading:
+				return
+			default:
+				m.appendToConsole("\n[ERROR reading payload: " + err.Error() + "]\n")
+				continue
+			}
+		}
+		
+		// Reconstruct full frame
+		frame := append([]byte{syncByte}, header...)
+		frame = append(frame, remaining...)
+		
+		// Parse and display the frame
+		m.parseFrameAndDisplay(frame)
 	}
 }
