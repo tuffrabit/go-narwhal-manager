@@ -67,6 +67,11 @@ func Connect(portName string, config *DeviceConfigOptions) (*Device, error) {
 		return nil, fmt.Errorf("failed to set DTR: %w", err)
 	}
 
+	// Wait for device to be ready. The TinyGo firmware waits for DTR before
+	// starting its serial read loop. We need to give it a moment to be ready
+	// to receive our first request, otherwise it may miss it.
+	time.Sleep(100 * time.Millisecond)
+
 	if err := port.SetReadTimeout(config.ReadTimeout); err != nil {
 		port.Close()
 		return nil, fmt.Errorf("failed to set read timeout: %w", err)
@@ -159,14 +164,39 @@ func (d *Device) sendRequest(request []byte) ([]byte, error) {
 	return response, nil
 }
 
-// Discover sends a discovery request and checks for valid response
+// Discover sends a discovery request and checks for valid response.
+// It retries a few times to handle race conditions during initial connection.
 func (d *Device) Discover() (bool, error) {
-	frame := BuildDiscoverFrame()
-	response, err := d.sendRequest(frame)
-	if err != nil {
-		return false, err
+	const maxRetries = 3
+	
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		frame := BuildDiscoverFrame()
+		response, err := d.sendRequest(frame)
+		if err != nil {
+			// On last attempt, return the error
+			if attempt == maxRetries-1 {
+				return false, err
+			}
+			// Otherwise retry after a short delay
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		
+		result, err := ParseDiscoverResponse(response)
+		if err != nil {
+			// On last attempt, return the error
+			if attempt == maxRetries-1 {
+				return false, err
+			}
+			// Otherwise retry after a short delay
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		
+		return result, nil
 	}
-	return ParseDiscoverResponse(response)
+	
+	return false, fmt.Errorf("discovery failed after %d attempts", maxRetries)
 }
 
 // GetDeviceConfig reads the current device configuration
