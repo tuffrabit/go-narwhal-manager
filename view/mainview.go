@@ -642,15 +642,36 @@ func (m *MainView) readSerialLoop() {
 
 // pingLoop runs a background health check that pings the device periodically.
 // If the device stops responding, it triggers the onDisconnect callback.
+// The ping is skipped when the serial console is open to avoid conflicts.
 func (m *MainView) pingLoop() {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
+	
+	consoleWasVisible := false
 	
 	for {
 		select {
 		case <-m.stopPingLoop:
 			return
 		case <-ticker.C:
+			// Skip ping when console is open - the console's read loop handles responses
+			if m.consoleVisible {
+				consoleWasVisible = true
+				continue
+			}
+			
+			// If console just closed, give it time to clean up and clear buffers
+			if consoleWasVisible {
+				time.Sleep(100 * time.Millisecond)
+				if m.serialPort != nil {
+					m.serialPort.ResetInputBuffer()
+					m.serialPort.ResetOutputBuffer()
+				}
+				consoleWasVisible = false
+				// Skip this tick to ensure clean state for next ping
+				continue
+			}
+			
 			if !m.pingDevice() {
 				// Ping failed - device disconnected
 				if m.onDisconnect != nil {
@@ -664,11 +685,27 @@ func (m *MainView) pingLoop() {
 
 // pingDevice sends a ping and waits for a response.
 // Returns true if successful, false if the device is not responding.
+// Retries once on failure to handle transient issues.
 func (m *MainView) pingDevice() bool {
 	if m.serialPort == nil {
 		return false
 	}
 	
+	// Try up to 2 times
+	for attempt := 0; attempt < 2; attempt++ {
+		if m.tryPing() {
+			return true
+		}
+		// Small delay between attempts
+		if attempt == 0 {
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	return false
+}
+
+// tryPing attempts a single ping and returns true if successful.
+func (m *MainView) tryPing() bool {
 	// Build ping frame with empty payload
 	pingFrame := protocol.BuildFrame(protocol.CmdPing, nil)
 	
@@ -681,16 +718,41 @@ func (m *MainView) pingDevice() bool {
 	}
 	
 	// Wait for response with timeout
-	buf := make([]byte, 32)
-	m.serialPort.SetReadTimeout(200 * time.Millisecond)
+	m.serialPort.SetReadTimeout(300 * time.Millisecond)
 	
-	n, err := m.serialPort.Read(buf)
-	if err != nil || n == 0 {
+	// Read and accumulate response until we have a complete frame or timeout
+	var response []byte
+	buf := make([]byte, 32)
+	
+	for len(response) < protocol.MinFrameSize {
+		n, err := m.serialPort.Read(buf)
+		if err != nil || n == 0 {
+			break
+		}
+		response = append(response, buf[:n]...)
+		
+		// Check if we have enough for a valid frame
+		if len(response) >= 4 {
+			payloadLen := uint16(response[2]) | uint16(response[3])<<8
+			expectedLen := protocol.MinFrameSize + int(payloadLen)
+			if len(response) >= expectedLen {
+				break
+			}
+		}
+	}
+	
+	// Validate response: need at least sync + status + len + crc
+	if len(response) < protocol.MinFrameSize {
 		return false
 	}
 	
-	// Try to parse response - just check for valid sync byte and OK status
-	if n >= protocol.MinFrameSize && buf[0] == protocol.SyncByte && buf[1] == protocol.StatusOK {
+	// Check for valid sync byte and OK status
+	if response[0] != protocol.SyncByte {
+		return false
+	}
+	
+	// Status is second byte
+	if response[1] == protocol.StatusOK {
 		return true
 	}
 	
