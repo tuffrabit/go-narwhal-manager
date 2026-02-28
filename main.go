@@ -43,7 +43,25 @@ func handleTuffDeviceTest(manager *AppManager) {
 		device = dev
 		serialPort = dev.Port()
 		PostEvent(func() {
-			manager.SwitchTo(view.NewMainView(serialPort))
+			// Create main view with disconnect callback
+			mainView := view.NewMainView(serialPort, func() {
+				// This is called when the device disconnects
+				fmt.Println("Device disconnected, returning to retry view")
+				// Clear device references
+				if device != nil {
+					device.Close()
+					device = nil
+				}
+				serialPort = nil
+				// Switch to retry view
+				manager.SwitchTo(view.NewDeviceRetryView(
+					fmt.Errorf("device disconnected"),
+					func() {
+						handleTuffDeviceTest(manager)
+					},
+				))
+			})
+			manager.SwitchTo(mainView)
 		}, false)
 	}
 }

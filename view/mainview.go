@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"time"
 
 	"go.bug.st/serial"
 	tk "modernc.org/tk9.0"
@@ -15,6 +16,7 @@ import (
 
 type MainView struct {
 	serialPort serial.Port
+	onDisconnect func() // Called when device disconnects
 	
 	// Main container
 	mainFrame *tk.TFrameWidget
@@ -31,6 +33,7 @@ type MainView struct {
 	// State
 	consoleVisible  bool
 	stopReading     chan struct{}
+	stopPingLoop    chan struct{}
 }
 
 // commandInfo holds metadata for each supported command
@@ -56,10 +59,12 @@ var availableCommands = []commandInfo{
 	{protocol.CmdDiscover, "Discover", "none", false},
 }
 
-func NewMainView(port serial.Port) *MainView {
+func NewMainView(port serial.Port, onDisconnect func()) *MainView {
 	return &MainView{
-		serialPort:  port,
-		stopReading: make(chan struct{}),
+		serialPort:   port,
+		onDisconnect: onDisconnect,
+		stopReading:  make(chan struct{}),
+		stopPingLoop: make(chan struct{}),
 	}
 }
 
@@ -80,6 +85,10 @@ func (m *MainView) Show(parent *tk.Window) {
 	
 	// Create console overlay (initially hidden)
 	m.createConsoleOverlay()
+	
+	// Start the ping monitor to detect disconnects
+	m.stopPingLoop = make(chan struct{})
+	go m.pingLoop()
 }
 
 func (m *MainView) Hide() {
@@ -87,6 +96,12 @@ func (m *MainView) Hide() {
 	if m.stopReading != nil {
 		close(m.stopReading)
 		m.stopReading = nil
+	}
+	
+	// Stop ping loop
+	if m.stopPingLoop != nil {
+		close(m.stopPingLoop)
+		m.stopPingLoop = nil
 	}
 	
 	// Destroy main frame
@@ -623,4 +638,61 @@ func (m *MainView) readSerialLoop() {
 		// Parse and display the frame
 		m.parseFrameAndDisplay(frame)
 	}
+}
+
+// pingLoop runs a background health check that pings the device periodically.
+// If the device stops responding, it triggers the onDisconnect callback.
+func (m *MainView) pingLoop() {
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-m.stopPingLoop:
+			return
+		case <-ticker.C:
+			if !m.pingDevice() {
+				// Ping failed - device disconnected
+				if m.onDisconnect != nil {
+					tk.PostEvent(m.onDisconnect, false)
+				}
+				return
+			}
+		}
+	}
+}
+
+// pingDevice sends a ping and waits for a response.
+// Returns true if successful, false if the device is not responding.
+func (m *MainView) pingDevice() bool {
+	if m.serialPort == nil {
+		return false
+	}
+	
+	// Build ping frame with empty payload
+	pingFrame := protocol.BuildFrame(protocol.CmdPing, nil)
+	
+	// Clear any pending input
+	m.serialPort.ResetInputBuffer()
+	
+	// Send ping
+	if _, err := m.serialPort.Write(pingFrame); err != nil {
+		return false
+	}
+	
+	// Wait for response with timeout
+	buf := make([]byte, 32)
+	m.serialPort.SetReadTimeout(200 * time.Millisecond)
+	
+	n, err := m.serialPort.Read(buf)
+	if err != nil || n == 0 {
+		return false
+	}
+	
+	// Try to parse response - just check for valid sync byte and OK status
+	if n >= protocol.MinFrameSize && buf[0] == protocol.SyncByte && buf[1] == protocol.StatusOK {
+		return true
+	}
+	
+	return false
 }
